@@ -347,6 +347,11 @@ class VanillaDataManagerConfig(DataManagerConfig):
     pixel_sampler: PixelSamplerConfig = field(default_factory=lambda: PixelSamplerConfig())
     """Specifies the pixel sampler used to sample pixels from images."""
 
+    noise_trans:float = 0.0
+    noise_rot:float = 0.0
+    direct_optim_cameras:bool = False
+    camp:bool = False
+
     def __post_init__(self):
         """Warn user of camera optimizer change."""
         if self.camera_optimizer is not None:
@@ -402,7 +407,7 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
             self.config.dataparser.data = Path(self.config.data)
         else:
             self.config.data = self.config.dataparser.data
-        self.dataparser = self.dataparser_config.setup()
+        self.dataparser = self.dataparser_config.setup(noise_trans=self.config.noise_trans, noise_rot=self.config.noise_rot, direct_optim_cameras=self.config.direct_optim_cameras, camp=self.config.camp)
         if test_mode == "inference":
             self.dataparser.downscale_factor = 1  # Avoid opening images
         self.includes_time = self.dataparser.includes_time
@@ -416,14 +421,14 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
         if self.config.images_on_gpu is True:
             self.exclude_batch_keys_from_device.remove("image")
 
-        if self.train_dataparser_outputs is not None:
-            cameras = self.train_dataparser_outputs.cameras
-            if len(cameras) > 1:
-                for i in range(1, len(cameras)):
-                    if cameras[0].width != cameras[i].width or cameras[0].height != cameras[i].height:
-                        CONSOLE.print("Variable resolution, using variable_res_collate")
-                        self.config.collate_fn = variable_res_collate
-                        break
+        # if self.train_dataparser_outputs is not None:
+        #     cameras = self.train_dataparser_outputs.cameras
+        #     if len(cameras) > 1:
+        #         for i in range(1, len(cameras)):
+        #             if cameras[0].width != cameras[i].width or cameras[0].height != cameras[i].height:
+        #                 CONSOLE.print("Variable resolution, using variable_res_collate")
+        #                 self.config.collate_fn = variable_res_collate
+        #                 break
         super().__init__()
 
     @cached_property

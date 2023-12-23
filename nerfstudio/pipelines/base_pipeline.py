@@ -268,6 +268,7 @@ class VanillaPipeline(Pipeline):
             pts_rgb = self.datamanager.train_dataparser_outputs.metadata["points3D_rgb"]
             seed_pts = (pts, pts_rgb)
         self.datamanager.to(device)
+        self.direct_optim_cameras = config.datamanager.direct_optim_cameras
         # TODO(ethan): get rid of scene_bounds from the model
         assert self.datamanager.train_dataset is not None, "Missing input dataset"
 
@@ -436,5 +437,8 @@ class VanillaPipeline(Pipeline):
         """
         datamanager_params = self.datamanager.get_param_groups()
         model_params = self.model.get_param_groups()
+        camera_params={}
+        if self.direct_optim_cameras:
+            camera_params=self.datamanager.train_dataset.cameras.get_param_groups()
         # TODO(ethan): assert that key names don't overlap
-        return {**datamanager_params, **model_params}
+        return {**datamanager_params, **model_params,**camera_params}

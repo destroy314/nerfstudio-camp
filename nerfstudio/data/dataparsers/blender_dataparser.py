@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 from nerfstudio.cameras.cameras import Cameras, CameraType
+from nerfstudio.cameras.lie_groups import se3_exp_map
 from nerfstudio.data.dataparsers.base_dataparser import (
     DataParser,
     DataParserConfig,
@@ -32,6 +33,7 @@ from nerfstudio.data.dataparsers.base_dataparser import (
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.io import load_from_json
+from nerfstudio.utils.poses import multiply
 
 
 @dataclass
@@ -56,11 +58,19 @@ class Blender(DataParser):
 
     config: BlenderDataParserConfig
 
-    def __init__(self, config: BlenderDataParserConfig):
+    def __init__(self, config: BlenderDataParserConfig,
+                 noise_trans=0.0,
+                 noise_rot = 0.0,
+                 direct_optim_cameras = False,
+                 camp = False):
         super().__init__(config=config)
         self.data: Path = config.data
         self.scale_factor: float = config.scale_factor
         self.alpha_color = config.alpha_color
+        self.noise_trans=noise_trans
+        self.noise_rot=noise_rot
+        self.direct_optim_cameras=direct_optim_cameras
+        self.camp=camp
 
     def _generate_dataparser_outputs(self, split="train"):
         if self.alpha_color is not None:
@@ -86,6 +96,16 @@ class Blender(DataParser):
         cy = image_height / 2.0
         camera_to_world = torch.from_numpy(poses[:, :3])  # camera to world transform
 
+        if split=="train":
+            std_vector = torch.tensor(
+                    [self.noise_trans] * 3 + [self.noise_rot] * 3, device=camera_to_world.device
+                )
+            mean_vector=torch.zeros((camera_to_world.shape[0], 6), device=camera_to_world.device)
+            pose_noise = se3_exp_map(torch.normal(mean_vector, std_vector))
+            pose_noise[:,:3,3]=pose_noise[:,3,:3]
+            pose_noise[:,3,:3]=0
+            camera_to_world=multiply(camera_to_world,pose_noise)
+
         # in x,y,z order
         camera_to_world[..., 3] *= self.scale_factor
         scene_box = SceneBox(aabb=torch.tensor([[-1.5, -1.5, -1.5], [1.5, 1.5, 1.5]], dtype=torch.float32))
@@ -97,6 +117,8 @@ class Blender(DataParser):
             cx=cx,
             cy=cy,
             camera_type=CameraType.PERSPECTIVE,
+            direct_optim_cameras=self.direct_optim_cameras,
+            camp=self.camp,
         )
 
         dataparser_outputs = DataparserOutputs(

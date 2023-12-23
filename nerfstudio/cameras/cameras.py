@@ -22,6 +22,7 @@ from enum import Enum, auto
 from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import cv2
+import numpy as np
 import torch
 import torchvision
 from jaxtyping import Float, Int, Shaped
@@ -31,6 +32,7 @@ from torch.nn import Parameter
 import nerfstudio.utils.math
 import nerfstudio.utils.poses as pose_utils
 from nerfstudio.cameras import camera_utils
+from nerfstudio.cameras.lie_groups import so3_log_map,so3_exp_map
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.data.scene_box import OrientedBox, SceneBox
 from nerfstudio.utils.tensor_dataclass import TensorDataclass
@@ -118,6 +120,8 @@ class Cameras(TensorDataclass):
         ] = CameraType.PERSPECTIVE,
         times: Optional[Float[Tensor, "num_cameras"]] = None,
         metadata: Optional[Dict] = None,
+        direct_optim_cameras:bool=False,
+        camp:bool=False
     ) -> None:
         """Initializes the Cameras object.
 
@@ -156,6 +160,80 @@ class Cameras(TensorDataclass):
         self.metadata = metadata
 
         self.__post_init__()  # This will do the dataclass post_init and broadcast all the tensors
+
+        self.direct_optim_cameras=direct_optim_cameras
+        self.init_params()
+        self.camp=camp
+        self.init_precondition()
+    
+    def init_params(self):
+        params=[]
+        for i in range(self.camera_to_worlds.shape[0]):
+            camera_to_world=self.camera_to_worlds[i]
+            so3_tangent=so3_log_map(camera_to_world[None,:3,:3])#[b,3]
+            param=torch.cat([so3_tangent[0],camera_to_world[...,3]],dim=-1)#[b,6]
+            params.append(param)
+        params=torch.stack(params)
+        self.params=torch.nn.Parameter(params).detach().cuda()
+        self.params.requires_grad=True
+
+    def init_precondition(self):
+        if self.camp:
+            self.preconditioner=[]
+            n=20
+            theta = np.random.uniform(0, np.pi, n)
+            phi = np.random.uniform(0, 2 * np.pi, n)
+            x = np.sin(theta) * np.cos(phi)
+            y = np.sin(theta) * np.sin(phi)
+            z = np.cos(theta)
+            points = np.stack([x, y, z], axis=1)
+            # points *= 2
+            points += [0,0,-4]
+            for i in range(self.camera_to_worlds.shape[0]):
+                camera_to_world=self.camera_to_worlds[i]
+                fx,fy,cx,cy=self.fx[i],self.fy[i],self.cx[i],self.cy[i]
+                points_in_world=np.matmul(camera_to_world[:3,:3],points.T).T+camera_to_world[None,:3,3]
+                points_in_world_hom=torch.cat([points_in_world,torch.ones_like(points_in_world[...,:1])],dim=-1)#[b,n,4]
+                points_in_world_hom=points_in_world_hom.float().detach()#[b,n,4]
+                def project(params):
+                    camera_to_world=so3_exp_map(params[None,:3])[0]#[b,3,4]
+                    camera_to_world_s=torch.eye(4)
+                    camera_to_world_s[:3,:3]=camera_to_world
+                    camera_to_world_s[:3,3]=params[3:]
+                    world_to_camera_s=torch.inverse(camera_to_world_s)
+
+                    camera_points=(world_to_camera_s[None,...]@points_in_world_hom[...,None])[...,0]#[b,n,4,1]
+
+                    u = (fx * camera_points[..., 0] / camera_points[..., 2]) + cx
+                    v = (fy * camera_points[..., 1] / camera_points[..., 2]) + cy
+
+                    # return torch.cat([u, v], dim=-1)#怎么连接应该无所谓？
+                    return torch.hstack([u[:,None],v[:,None]]).flatten()
+                jacobian = torch.autograd.functional.jacobian(project, self.params[i])#[b,2n,b,6]
+                self.preconditioner.append(jacobian.T@jacobian)
+            self.preconditioner=torch.stack(self.preconditioner).detach().cuda()
+        else:
+            self.preconditioner=torch.eye(6).repeat(self.camera_to_worlds.shape[0],1,1).cuda()
+
+    def get_c2w_from_params(self):
+        # if self.direct_optim_cameras:
+        c2w=torch.zeros((self.camera_to_worlds.shape[0],3,4)).cuda()
+        computed_params=(self.preconditioner@self.params[...,None])[...,0]
+        for i in range(self.camera_to_worlds.shape[0]):
+            camera_to_world=so3_exp_map(computed_params[None,i,:3])[0]
+            c2w[i,:3,:3]=camera_to_world
+            c2w[i,:3,3]=computed_params[i,3:]
+        return c2w
+        # else:
+        #     return self.camera_to_worlds
+    
+    def get_param_groups(self):
+        param_groups={}
+        if not self.direct_optim_cameras:
+            return param_groups
+        camera_opt_params = [self.params]#list(self.params)
+        param_groups["camera_opt"] = camera_opt_params
+        return param_groups
 
     def _init_get_fc_xy(self, fc_xy: Union[float, torch.Tensor], name: str) -> torch.Tensor:
         """
@@ -664,7 +742,7 @@ class Cameras(TensorDataclass):
         cam_types = torch.unique(self.camera_type, sorted=False)
         directions_stack = torch.empty((3,) + num_rays_shape + (3,), device=self.device)
 
-        c2w = self.camera_to_worlds[true_indices]
+        c2w = self.get_c2w_from_params()[true_indices]
         assert c2w.shape == num_rays_shape + (3, 4)
 
         def _compute_rays_for_omnidirectional_stereo(
@@ -695,7 +773,7 @@ class Cameras(TensorDataclass):
             isRightEye = 1 if eye == "right" else -1
 
             # find ODS camera position
-            c2w = self.camera_to_worlds[true_indices]
+            c2w = self.get_c2w_from_params()[true_indices]
             assert c2w.shape == num_rays_shape + (3, 4)
             transposedC2W = c2w[0][0].t()
             ods_cam_position = transposedC2W[3].repeat(c2w.shape[1], 1)
@@ -752,7 +830,7 @@ class Cameras(TensorDataclass):
             isRightEye = 1 if eye == "right" else -1
 
             # find VR180 camera position
-            c2w = self.camera_to_worlds[true_indices]
+            c2w = self.get_c2w_from_params()[true_indices]
             assert c2w.shape == num_rays_shape + (3, 4)
             transposedC2W = c2w[0][0].t()
             vr180_cam_position = transposedC2W[3].repeat(c2w.shape[1], 1)
@@ -924,6 +1002,7 @@ class Cameras(TensorDataclass):
         Returns:
             A JSON representation of the camera
         """
+        return {}
         flattened = self.flatten()
         times = flattened[camera_idx].times
         if times is not None:

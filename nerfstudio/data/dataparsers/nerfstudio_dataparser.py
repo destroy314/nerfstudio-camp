@@ -36,6 +36,8 @@ from nerfstudio.data.utils.dataparsers_utils import (
 )
 from nerfstudio.utils.io import load_from_json
 from nerfstudio.utils.rich_utils import CONSOLE
+from nerfstudio.cameras.lie_groups import se3_exp_map
+from nerfstudio.utils.poses import multiply
 
 MAX_AUTO_RESOLUTION = 1600
 
@@ -82,6 +84,17 @@ class Nerfstudio(DataParser):
 
     config: NerfstudioDataParserConfig
     downscale_factor: Optional[int] = None
+
+    def __init__(self, config: NerfstudioDataParserConfig,
+                 noise_trans=0.0,
+                 noise_rot = 0.0,
+                 direct_optim_cameras = False,
+                 camp = False):
+        super().__init__(config=config)
+        self.noise_trans=noise_trans
+        self.noise_rot=noise_rot
+        self.direct_optim_cameras=direct_optim_cameras
+        self.camp=camp
 
     def _generate_dataparser_outputs(self, split="train"):
         assert self.config.data.exists(), f"Data directory {self.config.data} does not exist."
@@ -294,6 +307,18 @@ class Nerfstudio(DataParser):
             distortion_params = torch.stack(distort, dim=0)[idx_tensor]
 
         metadata = {"fisheye_crop_radius": fisheye_crop_radius} if fisheye_crop_radius is not None else None
+        camera_to_world=poses[:, :3, :4]
+
+        if split=="train":
+            std_vector = torch.tensor(
+                    [self.noise_trans] * 3 + [self.noise_rot] * 3, device=camera_to_world.device
+                )
+            mean_vector=torch.zeros((camera_to_world.shape[0], 6), device=camera_to_world.device)
+            pose_noise = se3_exp_map(torch.normal(mean_vector, std_vector))
+            pose_noise[:,:3,3]=pose_noise[:,3,:3]
+            pose_noise[:,3,:3]=0
+            camera_to_world=multiply(camera_to_world,pose_noise)
+
         cameras = Cameras(
             fx=fx,
             fy=fy,
@@ -302,9 +327,11 @@ class Nerfstudio(DataParser):
             distortion_params=distortion_params,
             height=height,
             width=width,
-            camera_to_worlds=poses[:, :3, :4],
+            camera_to_worlds=camera_to_world,
             camera_type=camera_type,
             metadata=metadata,
+            direct_optim_cameras=self.direct_optim_cameras,
+            camp=self.camp,
         )
 
         assert self.downscale_factor is not None
